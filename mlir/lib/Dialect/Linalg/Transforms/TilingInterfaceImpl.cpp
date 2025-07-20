@@ -20,11 +20,15 @@
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
+#include "mlir/IR/Value.h"
 #include "mlir/Interfaces/TilingInterface.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "llvm/ADT/SmallVectorExtras.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/LogicalResult.h"
+#include <cstdint>
 #include <optional>
 
 #define DEBUG_TYPE "linalg-tiling-interface-impl"
@@ -744,6 +748,26 @@ static void applyPermToRange(SmallVector<OpFoldResult> &offsets,
   applyPermutationToVector<OpFoldResult>(sizes, permutation);
 }
 
+static std::optional<int64_t> getScalableTileSize(OpFoldResult tileSize) {
+  auto tileSizeVal = dyn_cast<Value>(tileSize);
+  if (!tileSizeVal)
+    return std::nullopt;
+  if (auto vscaleMultiplier = vector::getConstantVscaleMultiplier(tileSizeVal))
+    return vscaleMultiplier;
+  // For the nested tiling, the tile size value is usually the
+  // remainder calculation in the form of an `affine.min` op from the
+  // above loop. E.g. `affine.min(%remainder, %tile_size)` where
+  // %remainder is the active tile size of the distribution loop,
+  // which might be smaller than tile size for the last iteration.
+  // We get the tile size from the affine operation.
+  auto tileSizeAffineOp = tileSizeVal.getDefiningOp<affine::AffineMinOp>();
+  if (!tileSizeAffineOp || tileSizeAffineOp->getNumOperands() < 2)
+    return std::nullopt;
+  Value scalableTileSize =
+      tileSizeAffineOp->getOperand(tileSizeAffineOp->getNumOperands() - 1);
+  return vector::getConstantVscaleMultiplier(scalableTileSize);
+}
+
 struct PackOpTiling
     : public TilingInterface::ExternalModel<PackOpTiling, linalg::PackOp> {
 
@@ -1104,13 +1128,49 @@ static UnpackTileDimInfo getUnpackTileDimInfo(OpBuilder &b, UnPackOp unpackOp,
       presburger::BoundType::UB, tileSize,
       /*stopCondition=*/nullptr, /*closedUB=*/true);
   std::optional<int64_t> cstInnerSize = getConstantIntValue(innerTileSize);
-  if (!failed(cstSize) && cstInnerSize) {
-    if (*cstSize % *cstInnerSize == 0)
+  // TODO(egebeysel): The following is a workaround that we introduce to
+  // enable tiling and fusion in the existence of scalable inner tile
+  // sizes. The "nicer" solution for this requires reworking the tiling
+  // interface. See https://github.com/llvm/llvm-project/issues/150185.
+  bool assumeInnerTileSizesMatchTiles = false;
+  if (!cstInnerSize) {
+    Value scalableInnerTileSize = cast<Value>(innerTileSize);
+    std::optional<int64_t> staticInnerTileSize =
+        vector::getConstantVscaleMultiplier(scalableInnerTileSize);
+    // We assume that the scalable inner tile sizes are aligned to the
+    // tile sizes if the constant multiplier of vscale divides (or is greater
+    // than) the tile size, and the result is a power of 2. This matches the
+    // possible values of vscale.
+    if (staticInnerTileSize) {
+      std::optional<int64_t> staticTileSize;
+      auto tileSizeVsMultiplier = getScalableTileSize(tileSize);
+      if (tileSizeVsMultiplier) {
+        staticTileSize = *tileSizeVsMultiplier;
+        // This comparison only makes sense when we know both values are
+        // scalable.
+        assumeInnerTileSizesMatchTiles = *staticTileSize == *staticInnerTileSize;
+        llvm::outs() << "Matching inner tile sizes: " << assumeInnerTileSizesMatchTiles << "\n";
+      }
+      else if (succeeded(cstSize)) {
+        staticTileSize = *cstSize;
+        llvm::outs() << "Tile size: " << staticTileSize << "\n";
+      }
+      if (staticTileSize) {
+        info.isAlignedToInnerTileSize =
+            ((*staticTileSize % *staticInnerTileSize == 0 &&
+              llvm::isPowerOf2_64(*staticTileSize / *staticInnerTileSize)) ||
+             staticTileSize < *staticInnerTileSize);
+      }
+    }
+  }
+  if (assumeInnerTileSizesMatchTiles || (!failed(cstSize) && (cstInnerSize  || info.isAlignedToInnerTileSize))) {
+    if (assumeInnerTileSizesMatchTiles || *cstSize % *cstInnerSize == 0)
       info.isAlignedToInnerTileSize = true;
 
     // If the tiling size equals to the inner tiling size, the outer dims are
     // always 1.
-    if (*cstInnerSize == *cstSize) {
+    if (assumeInnerTileSizesMatchTiles ||
+        (cstInnerSize && *cstInnerSize == *cstSize)) {
       auto lhs = AV(dim0).bind(tileOffset);
       auto rhs = AV(dim1).bind(innerTileSize);
       info.sourceOffset = ab.floor(lhs, rhs);
