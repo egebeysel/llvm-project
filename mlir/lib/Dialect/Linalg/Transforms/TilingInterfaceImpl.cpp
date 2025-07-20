@@ -20,10 +20,14 @@
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
+#include "mlir/IR/Value.h"
 #include "mlir/Interfaces/TilingInterface.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/LogicalResult.h"
+#include <cstdint>
 #include <optional>
 
 #define DEBUG_TYPE "linalg-tiling-interface-impl"
@@ -1036,6 +1040,25 @@ struct UnpackTileDimInfo {
   OpFoldResult destExpandedSize;
 };
 
+FailureOr<int64_t> getStaticPartOfScalableTileSize(Operation *op) {
+  auto mulIOp = dyn_cast<arith::MulIOp>(op);
+  if (!mulIOp)
+    return failure();
+
+  auto lhs = mulIOp.getLhs().getDefiningOp();
+  auto rhs = mulIOp.getRhs().getDefiningOp();
+
+  auto cstOp = isa<arith::ConstantOp>(lhs) ? cast<arith::ConstantOp>(lhs)
+                                           : dyn_cast<arith::ConstantOp>(rhs);
+  if (!cstOp)
+    return failure();
+  if (!isa<vector::VectorScaleOp>(lhs) && !isa<vector::VectorScaleOp>(rhs))
+    return failure();
+  if (auto integerAttr = dyn_cast<IntegerAttr>(cstOp.getValue()))
+    return integerAttr.getInt();
+  return failure();
+}
+
 /// Returns the needed information for tiling unpack op on `tileDim` with given
 /// `tileOffset` and `tileSize`. For more details, see the comment of the
 /// `getTiledImplementation`.
@@ -1072,13 +1095,36 @@ static UnpackTileDimInfo getUnpackTileDimInfo(OpBuilder &b, UnPackOp unpackOp,
       presburger::BoundType::UB, tileSize,
       /*stopCondition=*/nullptr, /*closedUB=*/true);
   std::optional<int64_t> cstInnerSize = getConstantIntValue(innerTileSize);
-  if (!failed(cstSize) && cstInnerSize) {
-    if (*cstSize % *cstInnerSize == 0)
+  bool assumeInnerTileSizesMatchTiles = false;
+  if (!cstInnerSize) {
+    // Warning: Hard-coded separation of distribution and vector level tiling :D
+    Value scalableInnerTileSize = cast<Value>(innerTileSize);
+    auto staticInnerTileSize =
+        getStaticPartOfScalableTileSize(scalableInnerTileSize.getDefiningOp());
+    info.isAlignedToInnerTileSize = succeeded(staticInnerTileSize);
+    if (auto tileSizeVal = dyn_cast<Value>(tileSize)) {
+      if (auto tileSizeAffineOp =
+              tileSizeVal.getDefiningOp<affine::AffineMinOp>()) {
+        if (tileSizeAffineOp->getNumOperands() >= 2) {
+          Value scalableTileSize = tileSizeAffineOp->getOperand(tileSizeAffineOp->getNumOperands() - 1);
+          auto staticTileSize =
+              getStaticPartOfScalableTileSize(scalableTileSize.getDefiningOp());
+          assumeInnerTileSizesMatchTiles =
+              succeeded(staticTileSize) && succeeded(staticInnerTileSize) &&
+              staticTileSize.value() == staticInnerTileSize.value();
+        }
+      }
+    }
+  }
+  if (!failed(cstSize) && (cstInnerSize || assumeInnerTileSizesMatchTiles ||
+                           info.isAlignedToInnerTileSize)) {
+    if (assumeInnerTileSizesMatchTiles || *cstSize % *cstInnerSize == 0)
       info.isAlignedToInnerTileSize = true;
 
     // If the tiling size equals to the inner tiling size, the outer dims are
     // always 1.
-    if (*cstInnerSize == *cstSize) {
+    if (assumeInnerTileSizesMatchTiles ||
+        (cstInnerSize && *cstInnerSize == *cstSize)) {
       auto lhs = AV(dim0).bind(tileOffset);
       auto rhs = AV(dim1).bind(innerTileSize);
       info.sourceOffset = ab.floor(lhs, rhs);
