@@ -1806,7 +1806,7 @@ vectorizeAsTensorPackOp(RewriterBase &rewriter, linalg::PackOp packOp,
     inputShape[innerDimsPos[idx]] *= size;
   auto maskedRead = vector::createReadOrMaskedRead(
       rewriter, loc, packOp.getSource(), inputShape,
-      /*inputScalableVecSizes=*/{}, padValue, useInBoundsInsteadOfMasking);
+      padValue, useInBoundsInsteadOfMasking, /*scalableDims=*/{});
 
   // Create ShapeCastOp.
   SmallVector<int64_t> destShape(inputVectorSizes);
@@ -1962,9 +1962,8 @@ vectorizeAsTensorUnpackOp(RewriterBase &rewriter, linalg::UnPackOp unpackOp,
   // Read result, mask if necessary. If transferReadOp shape is not equal
   // to shape of source, then a mask is necessary.
   Value readResult = vector::createReadOrMaskedRead(
-      rewriter, loc, unpackOp.getSource(), readVectorSizes,
-      readScalableVectorFlags, padValue,
-      /*useInBoundsInsteadOfMasking=*/false);
+      rewriter, loc, unpackOp.getSource(), readVectorSizes, padValue,
+      /*useInBoundsInsteadOfMasking=*/false, readScalableVectorFlags);
 
   PackingMetadata packMetadata;
   SmallVector<int64_t> lastDimToInsertPosPerm =
@@ -2024,8 +2023,8 @@ vectorizeAsTensorPadOp(RewriterBase &rewriter, tensor::PadOp padOp,
   assert(succeeded(status) && "failed to reify result shapes");
   auto maskedRead = vector::createReadOrMaskedRead(
       rewriter, loc, padOp.getSource(), inputVectorSizes,
-      /*inputScalableVecSizes=*/{}, padValue,
-      /*useInBoundsInsteadOfMasking=*/false);
+      padValue,
+      /*useInBoundsInsteadOfMasking=*/false, /*scalableDims=*/{});
 
   // Create Xfer write Op
   Value dest = rewriter.create<tensor::EmptyOp>(
@@ -3158,9 +3157,9 @@ vectorizeAsInsertSliceOp(RewriterBase &rewriter, tensor::InsertSliceOp sliceOp,
   SmallVector<Value> readIndices(
       vecType.getRank(), rewriter.create<arith::ConstantIndexOp>(loc, 0));
   Value read = mlir::vector::createReadOrMaskedRead(
-      rewriter, loc, source, vecType.getShape(), /*inputScalableVecSizes=*/{},
+      rewriter, loc, source, vecType.getShape(),
       padValue,
-      /*useInBoundsInsteadOfMasking=*/inputVectorSizes.empty());
+      /*useInBoundsInsteadOfMasking=*/inputVectorSizes.empty(), /*scalableDims=*/{});
 
   // Create write
   auto writeIndices =
