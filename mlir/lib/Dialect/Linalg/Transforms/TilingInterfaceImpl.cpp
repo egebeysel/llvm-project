@@ -724,6 +724,25 @@ static void applyPermToRange(SmallVector<OpFoldResult> &offsets,
   applyPermutationToVector<OpFoldResult>(sizes, permutation);
 }
 
+static FailureOr<int64_t> getStaticPartOfScalableTileSize(Operation *op) {
+  auto mulIOp = dyn_cast<arith::MulIOp>(op);
+  if (!mulIOp)
+    return failure();
+
+  auto lhs = mulIOp.getLhs().getDefiningOp();
+  auto rhs = mulIOp.getRhs().getDefiningOp();
+
+  auto cstOp = isa<arith::ConstantOp>(lhs) ? cast<arith::ConstantOp>(lhs)
+                                           : dyn_cast<arith::ConstantOp>(rhs);
+  if (!cstOp)
+    return failure();
+  if (!isa<vector::VectorScaleOp>(lhs) && !isa<vector::VectorScaleOp>(rhs))
+    return failure();
+  if (auto integerAttr = dyn_cast<IntegerAttr>(cstOp.getValue()))
+    return integerAttr.getInt();
+  return failure();
+}
+
 struct PackOpTiling
     : public TilingInterface::ExternalModel<PackOpTiling, linalg::PackOp> {
 
@@ -950,7 +969,30 @@ struct PackOpTiling
         // another word, we can only support tiling with consumer if the tile
         // size for the producer is a multiple of the inner tile size for the
         // packed dimensions at this moment.
-        if ((failed(cstTileSize) || !cstInnerSize ||
+        bool assumeInnerTileSizesMatchTiles = false;
+        bool isAlignedToInnerTileSize = false;
+        if (!cstInnerSize) {
+          // Warning: Hard-coded separation of distribution and vector level tiling :D
+          Value scalableInnerTileSize = cast<Value>(dimAndTileMapping[dim]);
+          auto staticInnerTileSize =
+              getStaticPartOfScalableTileSize(scalableInnerTileSize.getDefiningOp());
+          isAlignedToInnerTileSize = succeeded(staticInnerTileSize);
+          if (auto tileSizeVal = dyn_cast<Value>(sizes[dim])) {
+            if (auto tileSizeAffineOp =
+                    tileSizeVal.getDefiningOp<affine::AffineMinOp>()) {
+              if (tileSizeAffineOp->getNumOperands() >= 2) {
+                Value scalableTileSize = tileSizeAffineOp->getOperand(tileSizeAffineOp->getNumOperands() - 1);
+                auto staticTileSize =
+                    getStaticPartOfScalableTileSize(scalableTileSize.getDefiningOp());
+                assumeInnerTileSizesMatchTiles =
+                    succeeded(staticTileSize) && succeeded(staticInnerTileSize) &&
+                    staticTileSize.value() == staticInnerTileSize.value();
+              }
+            }
+          }
+        }
+        // TODO: here comes the alignment flag
+        if (!isAlignedToInnerTileSize && (failed(cstTileSize) || !cstInnerSize ||
              *cstTileSize % *cstInnerSize != 0))
           return failure();
 
@@ -963,6 +1005,7 @@ struct PackOpTiling
         auto avSize = AV(dim0).bind(sizes[dim]);
         auto avTileSize = AV(sym).bind(dimAndTileMapping[dim]);
         outerDimOffsets.push_back(ab.floor(avOffset, avTileSize));
+        // TODO: here comes the equality one and 1 outer dim :)
         outerDimSizes.push_back(ab.ceil(avSize, avTileSize));
       } else {
         outerDimOffsets.push_back(offsets[dim]);
@@ -1039,25 +1082,6 @@ struct UnpackTileDimInfo {
   OpFoldResult resultOffset;
   OpFoldResult destExpandedSize;
 };
-
-FailureOr<int64_t> getStaticPartOfScalableTileSize(Operation *op) {
-  auto mulIOp = dyn_cast<arith::MulIOp>(op);
-  if (!mulIOp)
-    return failure();
-
-  auto lhs = mulIOp.getLhs().getDefiningOp();
-  auto rhs = mulIOp.getRhs().getDefiningOp();
-
-  auto cstOp = isa<arith::ConstantOp>(lhs) ? cast<arith::ConstantOp>(lhs)
-                                           : dyn_cast<arith::ConstantOp>(rhs);
-  if (!cstOp)
-    return failure();
-  if (!isa<vector::VectorScaleOp>(lhs) && !isa<vector::VectorScaleOp>(rhs))
-    return failure();
-  if (auto integerAttr = dyn_cast<IntegerAttr>(cstOp.getValue()))
-    return integerAttr.getInt();
-  return failure();
-}
 
 /// Returns the needed information for tiling unpack op on `tileDim` with given
 /// `tileOffset` and `tileSize`. For more details, see the comment of the
