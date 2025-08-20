@@ -994,7 +994,32 @@ struct PackOpTiling
         // another word, we can only support tiling with consumer if the tile
         // size for the producer is a multiple of the inner tile size for the
         // packed dimensions at this moment.
-        if ((failed(cstTileSize) || !cstInnerSize ||
+
+        // If we have non-static inner tile sizes, check if these are scalable
+        // and infer alignment.
+        // TODO(egebeysel): The following is a workaround that we introduce to
+        // enable tiling and fusion in the existence of scalable inner tile
+        // sizes. The "nicer" solution for this requires reworking the tiling
+        // interface. See https://github.com/llvm/llvm-project/issues/150185.
+        bool isAlignedToInnerTileSize = false;
+        if (!cstInnerSize) {
+          Value scalableInnerTileSize = cast<Value>(dimAndTileMapping[dim]);
+          auto staticInnerTileSize =
+              vector::getConstantVscaleMultiplier(scalableInnerTileSize);
+          int64_t staticTileSize;
+          if (succeeded(cstTileSize))
+            staticTileSize = *cstTileSize;
+          else if (auto cst = getScalableTileSize(sizes[dim]))
+            staticTileSize = *cst;
+          if (staticInnerTileSize && staticTileSize)
+            isAlignedToInnerTileSize =
+                ((staticTileSize % *staticInnerTileSize == 0 &&
+                  llvm::isPowerOf2_64(staticTileSize / *staticInnerTileSize)) ||
+                 staticTileSize < *staticInnerTileSize);
+          //
+        }
+        if (!isAlignedToInnerTileSize &&
+            (failed(cstTileSize) || !cstInnerSize ||
              *cstTileSize % *cstInnerSize != 0))
           return failure();
 
@@ -1007,6 +1032,7 @@ struct PackOpTiling
         auto avSize = AV(dim0).bind(sizes[dim]);
         auto avTileSize = AV(sym).bind(dimAndTileMapping[dim]);
         outerDimOffsets.push_back(ab.floor(avOffset, avTileSize));
+        // TODO: here comes the equality one and 1 outer dim :)
         outerDimSizes.push_back(ab.ceil(avSize, avTileSize));
       } else {
         outerDimOffsets.push_back(offsets[dim]);
