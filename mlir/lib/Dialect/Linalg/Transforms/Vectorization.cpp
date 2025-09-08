@@ -2200,6 +2200,7 @@ vectorizeAsLinalgContraction(RewriterBase &rewriter, VectorizationState &state,
 
   // Load operands.
   SmallVector<Value> vecOperands;
+  Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
   for (OpOperand &opOperand : linalgOp->getOpOperands()) {
     // The operand vector shape is computed by mapping the canonical vector
     // shape to the operand's domain. Further permutations are left as a part of
@@ -2210,12 +2211,22 @@ vectorizeAsLinalgContraction(RewriterBase &rewriter, VectorizationState &state,
     Type elemType = getElementTypeOrSelf(opOperand.get());
     VectorType readType =
         state.getCanonicalVecType(elemType, readMap.compose(indexingMap));
+    
+    SmallVector<Value> indices(linalgOp.getShape(&opOperand).size(), zero);
+    Operation *read = vector::TransferReadOp::create(
+        rewriter, loc, readType, opOperand.get(), indices,
+        /*padding=*/std::nullopt, readMap);
+    read = state.maskOperation(rewriter, read, linalgOp, indexingMap);
+    Value readValue = read->getResult(0);
 
-    Value read = mlir::vector::createReadOrMaskedRead(
-        rewriter, loc, opOperand.get(), readType.getShape(),
-        /*padding=*/arith::getZeroConstant(rewriter, loc, elemType),
-        /*useInBoundsInsteadOfMasking=*/false, readType.getScalableDims());
-    vecOperands.push_back(read);
+    // 3.b. If masked, set in-bounds to true. Masking guarantees that the access
+    // will be in-bounds.
+    if (auto maskOp = dyn_cast<vector::MaskingOpInterface>(read)) {
+      SmallVector<bool> inBounds(readType.getRank(), true);
+      cast<vector::TransferReadOp>(maskOp.getMaskableOp())
+          .setInBoundsAttr(rewriter.getBoolArrayAttr(inBounds));
+    }
+    vecOperands.push_back(readValue);
   }
 
   // Remap iterators from linalg to vector.
