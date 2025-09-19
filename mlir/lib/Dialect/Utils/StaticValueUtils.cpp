@@ -272,6 +272,8 @@ std::optional<int64_t> constantTripCount(OpFoldResult lb, OpFoldResult ub,
   std::optional<int64_t> lbConstant = getConstantIntValue(lb);
   if (!lbConstant)
     return std::nullopt;
+  if (*lbConstant == 0 && ub == step)
+    return 1;
   std::optional<int64_t> ubConstant = getConstantIntValue(ub);
   if (!ubConstant)
     return std::nullopt;
