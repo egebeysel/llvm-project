@@ -10,6 +10,7 @@
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Support/LLVM.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/DebugLog.h"
@@ -333,11 +334,14 @@ std::optional<APInt> constantTripCount(
   std::optional<std::pair<APInt, bool>> maybeLbCst = getConstantAPIntValue(lb);
   std::optional<std::pair<APInt, bool>> maybeUbCst = getConstantAPIntValue(ub);
   if (maybeLbCst) {
+    // If the lb is 0 and the ub and step are equal, we have a single-iteration.
+    if (maybeLbCst->first.isZero() && ub == step)
+      return APInt(bitwidth, 1);
     // If one of the bounds is not a constant, we can't compute the trip count.
     if (!maybeUbCst)
       return std::nullopt;
-    APSInt lbCst(maybeLbCst->first, /*isUnsigned=*/!isSigned);
     APSInt ubCst(maybeUbCst->first, /*isUnsigned=*/!isSigned);
+    APSInt lbCst(maybeLbCst->first, /*isUnsigned=*/!isSigned);
     if (!maybeUbCst)
       return std::nullopt;
     if (ubCst <= lbCst) {
