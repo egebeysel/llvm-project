@@ -1448,9 +1448,22 @@ struct UnPackOpTiling
     // tensor.unpack op is fusible (as a consumer) only if inner dims are not
     // tiled.
     int64_t numTiles = unPackOp.getInnerDimsPos().size();
-    for (auto iter :
+    for (auto [innerTileSize, tileSize] :
          llvm::zip_equal(unPackOp.getMixedTiles(), sizes.take_back(numTiles))) {
-      if (!isEqualConstantIntOrValue(std::get<0>(iter), std::get<1>(iter)))
+      if (isEqualConstantIntOrValue(innerTileSize, tileSize))
+        continue;
+
+      // If we have SSA values for the inner tile sizes, check if these are
+      // scalable.
+      auto innerTileSizeVal = dyn_cast<Value>(innerTileSize);
+      if (!innerTileSizeVal)
+        return failure();
+
+      std::optional<int64_t> staticInnerTileSize =
+          vector::getConstantVscaleMultiplier(innerTileSizeVal);
+      std::optional<int64_t> staticTileSize = getScalableTileSize(tileSize);
+      if (!staticInnerTileSize || !staticTileSize ||
+          *staticInnerTileSize != *staticTileSize)
         return failure();
     }
 
