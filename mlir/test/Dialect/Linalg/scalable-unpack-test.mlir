@@ -143,3 +143,68 @@ module attributes {transform.with_named_sequence} {
       transform.yield
   }
 }
+
+// -----
+
+// Test 5: Consumer fusion - linalg.unpack with scalable inner tiles fused as a
+// consumer into an scf.for loop. The loop step on the inner tile dimension
+// equals the unpack inner tile size (8*vscale), so fusion succeeds.
+
+#map = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK-LABEL: func.func @fuse_scalable_unpack_consumer
+// CHECK-SAME:      %[[ARG0:.+]]: tensor<32x?xf32>, %[[ARG1:.+]]: tensor<32x?xf32>, %[[ARG2:.+]]: tensor<32x?xf32>
+//      CHECK:    %[[VSCALE:.*]] = vector.vscale
+//      CHECK:    %[[C8_VSCALE:.*]] = arith.muli %[[VSCALE]], %{{.*}} : index
+//      CHECK:    %[[RES:.*]]:2 = scf.for {{.*}} step %[[C8_VSCALE]]
+// CHECK-SAME:        iter_args(%{{.*}} = %[[ARG2]], %{{.*}} = %{{.*}})
+//      CHECK:      linalg.generic
+//      CHECK:      %[[UNPACK:.*]] = linalg.unpack
+// CHECK-SAME:          inner_tiles = [%[[C8_VSCALE]]]
+//      CHECK:      scf.yield {{.*}}, %{{.*}} :
+//      CHECK:    return %[[RES]]#1
+func.func @fuse_scalable_unpack_consumer(
+    %arg0: tensor<32x?xf32>, %arg1: tensor<32x?xf32>,
+    %arg2: tensor<32x?xf32>) -> tensor<?xf32> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c8 = arith.constant 8 : index
+  %c32 = arith.constant 32 : index
+  %vscale = vector.vscale
+  %c8_vscale = arith.muli %c8, %vscale : index
+  %dim1 = tensor.dim %arg2, %c1 : tensor<32x?xf32>
+
+  %0 = scf.for %iv = %c0 to %dim1 step %c8_vscale iter_args(%out = %arg2) -> (tensor<32x?xf32>) {
+    %extracted = tensor.extract_slice %out[0, %iv] [32, %c8_vscale] [1, 1]
+        : tensor<32x?xf32> to tensor<32x?xf32>
+    %computed = linalg.generic {
+        indexing_maps = [#map, #map, #map],
+        iterator_types = ["parallel", "parallel"]}
+        ins(%arg0, %arg1 : tensor<32x?xf32>, tensor<32x?xf32>)
+        outs(%extracted : tensor<32x?xf32>) {
+      ^bb0(%in0: f32, %in1: f32, %out_elem: f32):
+        %mul = arith.mulf %in0, %in1 : f32
+        linalg.yield %mul : f32
+    } -> tensor<32x?xf32>
+    %inserted = tensor.insert_slice %computed into %out[0, %iv] [32, %c8_vscale] [1, 1]
+        : tensor<32x?xf32> into tensor<32x?xf32>
+    scf.yield %inserted : tensor<32x?xf32>
+  }
+
+  %output = tensor.empty(%dim1) : tensor<?xf32>
+  %unpack = linalg.unpack %0 outer_dims_perm = [0]
+      inner_dims_pos = [0] inner_tiles = [%c8_vscale]
+      into %output : tensor<32x?xf32> -> tensor<?xf32>
+  return %unpack : tensor<?xf32>
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %unpack = transform.structured.match ops{["linalg.unpack"]} in %arg1
+        : (!transform.any_op) -> !transform.any_op
+    %loop = transform.structured.match ops{["scf.for"]} in %arg1
+        : (!transform.any_op) -> !transform.any_op
+    %a, %b = transform.test.fuse_consumer %unpack into (%loop)
+        : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.yield
+  }
+}
