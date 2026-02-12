@@ -583,7 +583,8 @@ void transform::FuseOp::build(OpBuilder &builder, OperationState &result,
                               TypeRange loopTypes, Value target,
                               ArrayRef<int64_t> staticTileSizes,
                               ArrayRef<int64_t> staticTileInterchange,
-                              bool applyCleanup, bool useForall) {
+                              bool applyCleanup, bool useForall,
+                              std::optional<ArrayRef<bool>> scalableTileSizes) {
   return build(
       builder, result, loopTypes,
       /*target=*/target,
@@ -591,13 +592,14 @@ void transform::FuseOp::build(OpBuilder &builder, OperationState &result,
       getAsOpFoldResult(builder.getI64ArrayAttr(staticTileSizes)),
       /*mixedTileInterchange=*/
       getAsOpFoldResult(builder.getI64ArrayAttr(staticTileInterchange)),
-      applyCleanup, useForall);
+      applyCleanup, useForall, scalableTileSizes);
 }
 
 void transform::FuseOp::build(OpBuilder &builder, OperationState &result,
                               Value target, ArrayRef<int64_t> staticTileSizes,
                               ArrayRef<int64_t> staticTileInterchange,
-                              bool applyCleanup, bool useForall) {
+                              bool applyCleanup, bool useForall,
+                              std::optional<ArrayRef<bool>> scalableTileSizes) {
   return build(
       builder, result,
       /*target=*/target,
@@ -605,26 +607,28 @@ void transform::FuseOp::build(OpBuilder &builder, OperationState &result,
       getAsOpFoldResult(builder.getI64ArrayAttr(staticTileSizes)),
       /*mixedTileInterchange=*/
       getAsOpFoldResult(builder.getI64ArrayAttr(staticTileInterchange)),
-      applyCleanup, useForall);
+      applyCleanup, useForall, scalableTileSizes);
 }
 
 void transform::FuseOp::build(OpBuilder &builder, OperationState &result,
                               Value target,
                               ArrayRef<OpFoldResult> mixedTileSizes,
                               ArrayRef<OpFoldResult> mixedTileInterchange,
-                              bool applyCleanup, bool useForall) {
+                              bool applyCleanup, bool useForall,
+                              std::optional<ArrayRef<bool>> scalableTileSizes) {
   // Loop types are automaticaly splat by the callee, setting up one is
   // enough.
   SmallVector<Type> loopTypes(1, builder.getType<transform::AnyOpType>());
   build(builder, result, loopTypes, target, mixedTileSizes,
-        mixedTileInterchange, applyCleanup, useForall);
+        mixedTileInterchange, applyCleanup, useForall, scalableTileSizes);
 }
 
 void transform::FuseOp::build(OpBuilder &builder, OperationState &result,
                               TypeRange loopTypes, Value target,
                               ArrayRef<OpFoldResult> mixedTileSizes,
                               ArrayRef<OpFoldResult> mixedTileInterchange,
-                              bool applyCleanup, bool useForall) {
+                              bool applyCleanup, bool useForall,
+                              std::optional<ArrayRef<bool>> scalableTileSizes) {
   SmallVector<int64_t> staticTileSizes;
   SmallVector<Value> dynamicTileSizes;
   dispatchIndexOpFoldResults(mixedTileSizes, dynamicTileSizes, staticTileSizes);
@@ -648,6 +652,10 @@ void transform::FuseOp::build(OpBuilder &builder, OperationState &result,
     resultTypes.append(numExpectedLoops, loopTypes[0]);
   else
     llvm::append_range(resultTypes, loopTypes);
+  SmallVector<bool> expandedScalableTileSizes(mixedTileSizes.size(), false);
+  if (scalableTileSizes.has_value())
+    expandedScalableTileSizes.assign(scalableTileSizes->begin(),
+                                     scalableTileSizes->end());
   build(builder, result, /*transformed=*/target.getType(),
         /*loops=*/resultTypes,
         /*target=*/target,
@@ -655,6 +663,7 @@ void transform::FuseOp::build(OpBuilder &builder, OperationState &result,
         /*tile_interchange=*/dynamicTileInterchange,
         /*static_tile_sizes=*/staticTileSizesAttr,
         /*static_tile_interchange=*/staticTileInterchangeAttr,
+        /*scalable_tile_sizes=*/expandedScalableTileSizes,
         /*apply_cleanup=*/applyCleanup,
         /*use_forall=*/useForall);
 }
@@ -732,9 +741,25 @@ transform::FuseOp::apply(transform::TransformRewriter &rewriter,
   tilingOptions.setLoopType(useForall
                                 ? scf::SCFTilingOptions::LoopType::ForallOp
                                 : scf::SCFTilingOptions::LoopType::ForOp);
-  SmallVector<OpFoldResult> tileSizesOfr =
-      getAsIndexOpFoldResult(rewriter.getContext(), tileSizes);
-  tilingOptions = tilingOptions.setTileSizes(tileSizesOfr);
+  auto scalableTileSizes = getScalableTileSizes();
+  tilingOptions.setTileSizeComputationFunction(
+      [&](OpBuilder &b, Operation *) -> SmallVector<OpFoldResult> {
+        SmallVector<OpFoldResult> sizes;
+        sizes.reserve(tileSizes.size());
+        for (auto [idx, size] : llvm::enumerate(tileSizes)) {
+          if (!scalableTileSizes.empty() && scalableTileSizes[idx]) {
+            auto val =
+                arith::ConstantIndexOp::create(b, getLoc(), size);
+            Value vscale =
+                vector::VectorScaleOp::create(b, getLoc(), b.getIndexType());
+            sizes.push_back(
+                arith::MulIOp::create(b, getLoc(), val, vscale).getResult());
+          } else {
+            sizes.push_back(b.getIndexAttr(size));
+          }
+        }
+        return sizes;
+      });
   scf::SCFTileAndFuseOptions tileAndFuseOptions;
   tileAndFuseOptions.tilingOptions = tilingOptions;
 
@@ -762,6 +787,11 @@ transform::FuseOp::apply(transform::TransformRewriter &rewriter,
 }
 
 LogicalResult transform::FuseOp::verify() {
+  if (!getScalableTileSizes().empty() &&
+      getScalableTileSizes().size() != getStaticTileSizes().size())
+    return emitOpError("expected same number of tile sizes (")
+           << getStaticTileSizes().size() << ") and scalable tile sizes ("
+           << getScalableTileSizes().size() << ")";
   auto iterspace_rank = getStaticTileSizes().size();
   ArrayRef<int64_t> permutation = getStaticTileInterchange();
   if (permutation.size() > iterspace_rank)

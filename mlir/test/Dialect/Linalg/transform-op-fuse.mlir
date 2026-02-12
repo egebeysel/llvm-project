@@ -541,3 +541,34 @@ module attributes {transform.with_named_sequence} {
     transform.yield 
   }
 }
+
+// -----
+
+// Fuse with scalable tile sizes. The loop steps should be vscale * constant.
+
+// CHECK-LABEL: func.func @fuse_unary_scalable
+//       CHECK:   %[[VSCALE:.*]] = vector.vscale
+//       CHECK:   %[[STEP0:.*]] = arith.muli %[[VSCALE]], %{{.*}} : index
+//       CHECK:   %[[VSCALE_1:.*]] = vector.vscale
+//       CHECK:   %[[STEP1:.*]] = arith.muli %[[VSCALE_1]], %{{.*}} : index
+//       CHECK:   %[[RES:.*]] = scf.for {{.*}} step %[[STEP0]]
+//       CHECK:     scf.for {{.*}} step %[[STEP1]]
+//       CHECK:       linalg.exp
+//       CHECK:       linalg.add
+//       CHECK:   return %[[RES]]
+func.func @fuse_unary_scalable(%arg0: tensor<?x?xf32>, %arg1: tensor<?x?xf32>) -> tensor<?x?xf32> {
+  %0 = linalg.exp ins(%arg0 : tensor<?x?xf32>)
+                             outs(%arg1: tensor<?x?xf32>) -> tensor<?x?xf32>
+  %1 = linalg.add ins(%0, %arg0 : tensor<?x?xf32>, tensor<?x?xf32>)
+                             outs(%arg1: tensor<?x?xf32>) -> tensor<?x?xf32>
+  return %1 : tensor<?x?xf32>
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.add"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %1, %loops:2 = transform.structured.fuse %0 tile_sizes [[4], [8]] interchange [0, 1]
+      : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+      transform.yield
+  }
+}

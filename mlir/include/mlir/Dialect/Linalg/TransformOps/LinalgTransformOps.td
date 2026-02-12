@@ -408,6 +408,7 @@ def FuseOp : Op<Transform_Dialect, "structured.fuse",
         Variadic<TransformAnyParamTypeOrAnyHandle> : $tile_interchange,
         DefaultValuedOptionalAttr<DenseI64ArrayAttr, "{}">:$static_tile_sizes,
         DefaultValuedOptionalAttr<DenseI64ArrayAttr, "{}">:$static_tile_interchange,
+        DefaultValuedOptionalAttr<DenseBoolArrayAttr, "{}">:$scalable_tile_sizes,
         UnitAttr:$apply_cleanup,
         UnitAttr:$use_forall);
   let results = (outs TransformHandleTypeInterface:$transformed,
@@ -418,28 +419,36 @@ def FuseOp : Op<Transform_Dialect, "structured.fuse",
                    "ArrayRef<int64_t>":$staticTileSizes,
                    "ArrayRef<int64_t>":$staticTileInterchange,
                    CArg<"bool", "false">:$applyCleanup,
-                   CArg<"bool", "false">:$useForall)>,
+                   CArg<"bool", "false">:$useForall,
+                   CArg<"std::optional<ArrayRef<bool>>", "std::nullopt">:
+                      $scalableTileSizes)>,
     OpBuilder<(ins "TypeRange":$loopTypes,
                    "Value":$target,
                    "ArrayRef<OpFoldResult>":$mixedTileSizes,
                    "ArrayRef<OpFoldResult>":$mixedTileInterchange,
                    CArg<"bool", "false">:$applyCleanup,
-                   CArg<"bool", "false">:$useForall)>,
+                   CArg<"bool", "false">:$useForall,
+                   CArg<"std::optional<ArrayRef<bool>>", "std::nullopt">:
+                      $scalableTileSizes)>,
     OpBuilder<(ins "Value":$target,
                    "ArrayRef<int64_t>":$staticTileSizes,
                    "ArrayRef<int64_t>":$staticTileInterchange,
                    CArg<"bool", "false">:$applyCleanup,
-                   CArg<"bool", "false">:$useForall)>,
+                   CArg<"bool", "false">:$useForall,
+                   CArg<"std::optional<ArrayRef<bool>>", "std::nullopt">:
+                      $scalableTileSizes)>,
     OpBuilder<(ins "Value":$target,
                    "ArrayRef<OpFoldResult>":$mixedTileSizes,
                    "ArrayRef<OpFoldResult>":$mixedTileInterchange,
                    CArg<"bool", "false">:$applyCleanup,
-                   CArg<"bool", "false">:$useForall)>,
+                   CArg<"bool", "false">:$useForall,
+                   CArg<"std::optional<ArrayRef<bool>>", "std::nullopt">:
+                      $scalableTileSizes)>,
   ];
 
   let assemblyFormat = [{
     $target oilist(
-      `tile_sizes` custom<DynamicIndexList>($tile_sizes, $static_tile_sizes) |
+      `tile_sizes` custom<DynamicIndexList>($tile_sizes, $static_tile_sizes, $scalable_tile_sizes) |
       `interchange` custom<DynamicIndexList>($tile_interchange, $static_tile_interchange)
     )
     attr-dict `:` functional-type(operands, results)
