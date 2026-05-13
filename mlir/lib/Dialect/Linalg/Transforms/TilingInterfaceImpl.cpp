@@ -768,6 +768,19 @@ static std::optional<int64_t> getScalableTileSize(OpFoldResult tileSize) {
   return vector::getConstantVscaleMultiplier(scalableTileSize);
 }
 
+static inline bool isPerfectlyTiledBy(int64_t tileSize, int64_t innerTileSize) {
+  return tileSize % innerTileSize == 0;
+}
+
+// Scalable inner tile alignment: on the constant vscale multipliers,
+// tile is a power-of-2 multiple of inner, or strictly smaller (sub-tile
+// case).
+static inline bool isScalablyAlignedTo(int64_t tileMult, int64_t innerMult) {
+  return tileMult < innerMult ||
+           (tileMult % innerMult == 0 &&
+            llvm::isPowerOf2_64(tileMult / innerMult));
+}
+
 struct PackOpTiling
     : public TilingInterface::ExternalModel<PackOpTiling, linalg::PackOp> {
 
@@ -998,9 +1011,37 @@ struct PackOpTiling
         // another word, we can only support tiling with consumer if the tile
         // size for the producer is a multiple of the inner tile size for the
         // packed dimensions at this moment.
-        if ((failed(cstTileSize) || !cstInnerSize ||
-             *cstTileSize % *cstInnerSize != 0))
-          return failure();
+
+        // If we have non-static inner tile sizes, check if these are scalable
+        // and infer alignment.
+        // TODO(egebeysel): The following is a workaround that we introduce to
+        // enable tiling and fusion in the existence of scalable inner tile
+        // sizes. The "nicer" solution for this requires reworking the tiling
+        // interface. See https://github.com/llvm/llvm-project/issues/150185.
+        bool assumeInnerTileSizesMatchTiles = false;
+        bool hasStaticTileSize = succeeded(cstTileSize);
+        bool hasStaticInnerTile = cstInnerSize.has_value();
+        if (hasStaticInnerTile) {
+          if (!hasStaticTileSize)
+            return failure();
+          if (!isPerfectlyTiledBy(*cstTileSize, *cstInnerSize))
+            return failure();
+        } else {
+          Value scalableInner = cast<Value>(dimAndTileMapping[dim]);
+          std::optional<int64_t> maybeInnerMult =
+              vector::getConstantVscaleMultiplier(scalableInner);
+          std::optional<int64_t> maybeTileMult;
+          if (hasStaticTileSize)
+            maybeTileMult = *cstTileSize;
+          else
+            maybeTileMult = getScalableTileSize(sizes[dim]);
+
+          if (!maybeInnerMult || !maybeTileMult)
+            return failure();
+          if (!isScalablyAlignedTo(*maybeTileMult, *maybeInnerMult))
+            return failure();
+          assumeInnerTileSizesMatchTiles = !hasStaticTileSize && *maybeInnerMult == *maybeTileMult;
+        }
 
         using AV = affine::AffineValueExpr;
         affine::AffineBuilder ab(b, loc);
@@ -1011,7 +1052,11 @@ struct PackOpTiling
         auto avSize = AV(dim0).bind(sizes[dim]);
         auto avTileSize = AV(sym).bind(dimAndTileMapping[dim]);
         outerDimOffsets.push_back(ab.floor(avOffset, avTileSize));
-        outerDimSizes.push_back(ab.ceil(avSize, avTileSize));
+        // If the tiling size equals to the inner tiling size, the outer dims
+        // are always 1.
+        outerDimSizes.push_back(assumeInnerTileSizesMatchTiles
+                                    ? b.getIndexAttr(1)
+                                    : ab.ceil(avSize, avTileSize));
       } else {
         outerDimOffsets.push_back(offsets[dim]);
         outerDimSizes.push_back(sizes[dim]);
@@ -1135,29 +1180,30 @@ static UnpackTileDimInfo getUnpackTileDimInfo(OpBuilder &b, UnPackOp unpackOp,
   bool assumeInnerTileSizesMatchTiles = false;
   if (!cstInnerSize) {
     Value scalableInnerTileSize = cast<Value>(innerTileSize);
-    std::optional<int64_t> staticInnerTileSize =
+    std::optional<int64_t> maybeStaticInnerTileSize =
         vector::getConstantVscaleMultiplier(scalableInnerTileSize);
     // We assume that the scalable inner tile sizes are aligned to the
     // tile sizes if the constant multiplier of vscale divides (or is greater
     // than) the tile size, and the result is a power of 2. This matches the
     // possible values of vscale.
-    if (staticInnerTileSize) {
-      std::optional<int64_t> staticTileSize;
+    if (maybeStaticInnerTileSize) {
+      std::optional<int64_t> maybeStaticTileSize;
       if (succeeded(cstSize)) {
-        staticTileSize = *cstSize;
+        maybeStaticTileSize = *cstSize;
       } else if (std::optional<int64_t> tileSizeVsMultiplier =
                      getScalableTileSize(tileSize)) {
-        staticTileSize = *tileSizeVsMultiplier;
+        maybeStaticTileSize = *tileSizeVsMultiplier;
         // This comparison only makes sense when we know both values are
         // scalable.
         assumeInnerTileSizesMatchTiles =
-            *staticTileSize == *staticInnerTileSize;
+            *maybeStaticTileSize == *maybeStaticInnerTileSize;
       }
-      if (staticTileSize) {
+      if (maybeStaticTileSize) {
         info.isAlignedToInnerTileSize =
-            ((*staticTileSize % *staticInnerTileSize == 0 &&
-              llvm::isPowerOf2_64(*staticTileSize / *staticInnerTileSize)) ||
-             staticTileSize < *staticInnerTileSize);
+            ((*maybeStaticTileSize % *maybeStaticInnerTileSize == 0 &&
+              llvm::isPowerOf2_64(*maybeStaticTileSize /
+                                  *maybeStaticInnerTileSize)) ||
+             maybeStaticTileSize < *maybeStaticInnerTileSize);
       }
     }
   }
@@ -1450,11 +1496,12 @@ struct UnPackOpTiling
       if (!innerTileSizeVal)
         return failure();
 
-      std::optional<int64_t> staticInnerTileSize =
+      std::optional<int64_t> maybeStaticInnerTileSize =
           vector::getConstantVscaleMultiplier(innerTileSizeVal);
-      std::optional<int64_t> staticTileSize = getScalableTileSize(tileSize);
-      if (!staticInnerTileSize || !staticTileSize ||
-          *staticInnerTileSize != *staticTileSize)
+      std::optional<int64_t> maybeStaticTileSize =
+          getScalableTileSize(tileSize);
+      if (!maybeStaticInnerTileSize || !maybeStaticTileSize ||
+          *maybeStaticInnerTileSize != *maybeStaticTileSize)
         return failure();
     }
 
