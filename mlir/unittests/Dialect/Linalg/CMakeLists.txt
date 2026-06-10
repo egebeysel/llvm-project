@@ -8,4 +8,5 @@ mlir_target_link_libraries(MLIRLinalgTests
   MLIRFuncDialect
   MLIRLinalgDialect
   MLIRTensorDialect
+  MLIRTilingInterface
 )

@@ -2919,7 +2919,14 @@ SmallVector<utils::IteratorType> SoftmaxOp::getLoopIteratorTypes() {
 FailureOr<TilingResult>
 SoftmaxOp::getTiledImplementation(OpBuilder &builder,
                                   ArrayRef<OpFoldResult> offsets,
-                                  ArrayRef<OpFoldResult> sizes) {
+                                  ArrayRef<OpFoldResult> sizes,
+                                  ArrayRef<InnerTileAlignment>) {
+  return getTiledImplementation(builder, offsets, sizes);
+}
+
+FailureOr<TilingResult> SoftmaxOp::getTiledImplementation(
+    OpBuilder &builder, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes) {
   int64_t rank = getInputOperandRank();
   auto oneAttr = builder.getI64IntegerAttr(1);
   SmallVector<OpFoldResult> strides(rank, oneAttr);
@@ -3277,6 +3284,12 @@ LogicalResult WinogradFilterTransformOp::getResultTilePosition(
 /// `sizes` are the values for the sizes of F, KH, KW, C for one tile.
 FailureOr<TilingResult> WinogradFilterTransformOp::getTiledImplementation(
     OpBuilder &builder, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes, ArrayRef<InnerTileAlignment>) {
+  return getTiledImplementation(builder, offsets, sizes);
+}
+
+FailureOr<TilingResult> WinogradFilterTransformOp::getTiledImplementation(
+    OpBuilder &builder, ArrayRef<OpFoldResult> offsets,
     ArrayRef<OpFoldResult> sizes) {
   IntegerAttr oneAttr = builder.getI64IntegerAttr(1);
   IntegerAttr zeroAttr = builder.getI64IntegerAttr(0);
@@ -3428,10 +3441,15 @@ LogicalResult WinogradInputTransformOp::getResultTilePosition(
 /// C) Users can specify the tile sizes of tileH, tileW, N, and C. `offsets` are
 /// the values for the offsets of tileH, tileW, N, C for one tile. `sizes` are
 /// the values for the sizes of tileH, tileW, N, C for one tile.
-FailureOr<TilingResult>
-WinogradInputTransformOp::getTiledImplementation(OpBuilder &builder,
-                                                 ArrayRef<OpFoldResult> offsets,
-                                                 ArrayRef<OpFoldResult> sizes) {
+FailureOr<TilingResult> WinogradInputTransformOp::getTiledImplementation(
+    OpBuilder &builder, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes, ArrayRef<InnerTileAlignment>) {
+  return getTiledImplementation(builder, offsets, sizes);
+}
+
+FailureOr<TilingResult> WinogradInputTransformOp::getTiledImplementation(
+    OpBuilder &builder, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes) {
   IntegerAttr oneAttr = builder.getI64IntegerAttr(1);
   WinogradConv2DFmr fmr = getFmr();
   int64_t m, r;
@@ -3623,6 +3641,12 @@ LogicalResult WinogradOutputTransformOp::getResultTilePosition(
 /// specify the tile sizes of tileH, tileW, N, and F. `offsets` are the values
 /// for the offsets of tileH, tileW, N, F for one tile. `sizes` are the values
 /// for the sizes of tileH, tileW, N, F for one tile.
+FailureOr<TilingResult> WinogradOutputTransformOp::getTiledImplementation(
+    OpBuilder &builder, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes, ArrayRef<InnerTileAlignment>) {
+  return getTiledImplementation(builder, offsets, sizes);
+}
+
 FailureOr<TilingResult> WinogradOutputTransformOp::getTiledImplementation(
     OpBuilder &builder, ArrayRef<OpFoldResult> offsets,
     ArrayRef<OpFoldResult> sizes) {
