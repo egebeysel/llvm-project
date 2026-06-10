@@ -31,6 +31,19 @@ namespace scf {
 using SCFTileSizeComputationFunction =
     std::function<SmallVector<OpFoldResult>(OpBuilder &, Operation *)>;
 
+/// Computation function returning, for the op currently being tiled or fused,
+/// the per-iteration-domain-dimension `InnerTileAlignment` array to use (see
+/// `InnerTileAlignment`). The driver invokes it once per tiling/fusion of an
+/// op, so the returned array is always in *that op's own* domain -- the driver
+/// does not remap it. `tileSizes` holds the given tile sizes for pure tiling
+/// and is empty for fusion; `slices` holds the `tensor.extract_slice` (producer
+/// fusion) or `tensor.insert_slice`/`tensor.parallel_insert_slice`s (consumer
+/// fusion) being fused, and is empty for pure tiling. Only pack/unpack
+/// implementations consult the result; every other op ignores it.
+using InnerTileAlignmentFnTy = std::function<SmallVector<InnerTileAlignment>(
+    TilingInterface op, ArrayRef<OpFoldResult> tileSizes,
+    ArrayRef<Operation *> slices)>;
+
 /// Options to use to control tiling.
 struct SCFTilingOptions {
   /// Specify which loop construct to use for tile and fuse.
@@ -62,6 +75,34 @@ struct SCFTilingOptions {
   SmallVector<int64_t> interchangeVector = {};
   SCFTilingOptions &setInterchange(ArrayRef<int64_t> interchange) {
     interchangeVector = llvm::to_vector(interchange);
+    return *this;
+  }
+
+  /// Optional control function returning, per tiled/fused op, the caller
+  /// assertion of how each loop tile size relates to a tiled
+  /// `linalg.pack`/`linalg.unpack` op's inner tile size, in that op's own
+  /// iteration domain (see `InnerTileAlignmentFnTy` and `InnerTileAlignment`).
+  /// The driver invokes it once per tiling/fusion of an op. A null function
+  /// (the default) means "no information", in which case the relationship is
+  /// derived from the IR. Consulted only by pack/unpack implementations;
+  /// ignored by every other op.
+  InnerTileAlignmentFnTy innerTileAlignmentFn = nullptr;
+  SCFTilingOptions &setInnerTileAlignmentFn(InnerTileAlignmentFnTy fn) {
+    innerTileAlignmentFn = std::move(fn);
+    return *this;
+  }
+  /// Convenience setter installing a constant `innerTileAlignmentFn` that
+  /// returns `alignments` for every op, ignoring which op is being tiled or
+  /// fused. Use when a single fixed array is correct for the whole tiling/fusion
+  /// (e.g. tiling a single op); callers fusing several ops with differing
+  /// iteration domains should use `setInnerTileAlignmentFn` so each op gets an
+  /// array in its own domain.
+  SCFTilingOptions &
+  setInnerTileAlignments(ArrayRef<InnerTileAlignment> alignments) {
+    SmallVector<InnerTileAlignment> fixed = llvm::to_vector(alignments);
+    innerTileAlignmentFn = [fixed = std::move(fixed)](
+                               TilingInterface, ArrayRef<OpFoldResult>,
+                               ArrayRef<Operation *>) { return fixed; };
     return *this;
   }
 
@@ -239,10 +280,14 @@ struct SCFTilingResult {
 };
 
 /// Method to tile an op that implements the `TilingInterface` using
-/// `scf.for` for iterating over the tiles.
-FailureOr<SCFTilingResult> tileUsingSCF(RewriterBase &rewriter,
-                                        TilingInterface op,
-                                        const SCFTilingOptions &options);
+/// `scf.for` for iterating over the tiles. When tiling a
+/// `linalg.pack`/`linalg.unpack` op, `options.innerTileAlignmentFn` (if set) is
+/// invoked with the op and the tile sizes to obtain a caller assertion of how
+/// each loop tile size relates to the inner tile (see `InnerTileAlignment`); it
+/// is ignored for every other op.
+FailureOr<SCFTilingResult>
+tileUsingSCF(RewriterBase &rewriter, TilingInterface op,
+             const SCFTilingOptions &options);
 
 /// Options used to control tile + fuse.
 struct SCFTileAndFuseOptions {
@@ -287,20 +332,27 @@ struct SCFTileAndFuseOptions {
   std::optional<FrozenRewritePatternSet> cleanupPatterns = std::nullopt;
 };
 
-/// Fuse the producer of the source of `candidateSliceOp` by computing the
-/// required slice of the producer in-place.  Note that the method
-/// replaces the uses of `candidateSliceOp` with the tiled and fused producer
-/// value but does not delete the slice operation.
+/// Result of fusing the producer of the source of a `tensor.extract_slice`.
 struct SCFFuseProducerOfSliceResult {
   OpResult origProducer;       // Original untiled producer.
   Value tiledAndFusedProducer; // Tile and fused producer value.
   SmallVector<Operation *> tiledOps;
   SmallVector<Operation *> generatedSlices;
 };
+/// Fuse the producer of the source of `candidateSliceOp` by computing the
+/// required slice of the producer in-place.  Note that the method
+/// replaces the uses of `candidateSliceOp` with the tiled and fused producer
+/// value but does not delete the slice operation.
+///
+/// When the fused producer is a `linalg.pack`/`linalg.unpack`, `fn` (if
+/// non-null) is invoked with the producer and `candidateSliceOp` to obtain the
+/// inner-tile alignment hint in the producer's own iteration domain (see
+/// `InnerTileAlignmentFnTy`). A null `fn` (the default) means "no hint".
 std::optional<SCFFuseProducerOfSliceResult>
 tileAndFuseProducerOfSlice(RewriterBase &rewriter,
                            tensor::ExtractSliceOp candidateSliceOp,
-                           MutableArrayRef<LoopLikeOpInterface> loops);
+                           MutableArrayRef<LoopLikeOpInterface> loops,
+                           const InnerTileAlignmentFnTy &fn = nullptr);
 
 /// Reconstruct the fused producer from within the tiled-and-fused code. Based
 /// on the slice of the producer computed in place it is possible that within
@@ -404,6 +456,17 @@ struct SCFTileAndFuseResult {
 ///   %4 = linalg.matmul .. outs(%3 : ...)
 /// }
 /// ```
+///
+/// When the tiled root `consumer` or a fused producer is a
+/// `linalg.pack`/`linalg.unpack` op,
+/// `options.tilingOptions.innerTileAlignmentFn` may carry a caller assertion of
+/// how each loop tile size relates to the inner tile (see `InnerTileAlignment`).
+/// The control function is invoked separately for the root op and for each
+/// fused producer, with that op and the relevant slice, so each gets an array in
+/// its own iteration domain -- the driver does not remap a shared array. A
+/// chain may therefore contain several hint-consuming ops with differing
+/// iteration domains. The assertion is unchecked: a wrong entry silently
+/// mistiles that op, by design (the control function owns its correctness).
 FailureOr<SCFTileAndFuseResult>
 tileConsumerAndFuseProducersUsingSCF(RewriterBase &rewriter,
                                      TilingInterface consumer,
@@ -426,18 +489,29 @@ struct SCFFuseConsumerOfSliceResult {
   SmallVector<OpOperand *> tiledAndFusedConsumerOperands;
   SmallVector<Operation *> tiledOps;
 };
+/// When the consumer is a `linalg.pack`/`linalg.unpack`, `fn` (if non-null) is
+/// invoked with the consumer and `candidateSlices` to obtain the inner-tile
+/// alignment hint in the consumer's own iteration domain (see
+/// `InnerTileAlignmentFnTy`). A null `fn` (the default) means "no hint".
 FailureOr<scf::SCFFuseConsumerOfSliceResult>
 tileAndFuseConsumerOfSlices(RewriterBase &rewriter,
                             ArrayRef<Operation *> candidateSlices,
-                            MutableArrayRef<LoopLikeOpInterface> loops);
+                            MutableArrayRef<LoopLikeOpInterface> loops,
+                            const InnerTileAlignmentFnTy &fn = nullptr);
 
 /// Fuse the `consumer` operation into the loop nest provided by `loops`.
 /// The transformation looks for operands in the `consumer` that are defined
 /// by the outermost loop of the loop nest in `loops`. The nested loop is
 /// expected to have the structure of the loops generated through tiling.
+///
+/// When the consumer is a `linalg.pack`/`linalg.unpack`, `fn` (if non-null) is
+/// invoked with the `consumer` and the fused slices to obtain the inner-tile
+/// alignment hint in the consumer's own iteration domain (see
+/// `InnerTileAlignmentFnTy`). A null `fn` (the default) means "no hint".
 FailureOr<scf::SCFFuseConsumerOfSliceResult>
 tileAndFuseConsumer(RewriterBase &rewriter, Operation *consumer,
-                    MutableArrayRef<LoopLikeOpInterface> loops);
+                    MutableArrayRef<LoopLikeOpInterface> loops,
+                    const InnerTileAlignmentFnTy &fn = nullptr);
 
 /// Method to lower an `op` that implements the `TilingInterface` to
 /// loops/scalars.
