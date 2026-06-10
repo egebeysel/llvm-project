@@ -66,6 +66,64 @@ struct MergeResult {
   SmallVector<Value> replacements;
 };
 
+/// Per-dimension alignment of a loop tile size to a `linalg.pack` /
+/// `linalg.unpack` inner tile size, supplied by the caller (which performed the
+/// tiling and knows both the tile sizes and the inner tiles) so that pack/unpack
+/// TilingInterface implementations need not re-derive it from the materialized
+/// IR. An absent entry (or `Unknown`) means "no information": the implementation
+/// must fall back to its prior behavior for that dimension.
+///   - `Multiple`: the loop tile size is an integer multiple of the inner tile.
+///   - `Equal`:    the loop tile size equals the inner tile size.
+///
+/// This is a caller assertion, not a checked fact: it is only consulted when the
+/// relationship cannot be decided from the IR (e.g., scalable or dynamic sizes).
+/// When the tile and inner-tile sizes are both statically known, implementations
+/// trust that static comparison instead, so a hint that contradicts statically
+/// known sizes is ignored rather than allowed to produce incorrect tiling. The
+/// hint is otherwise never verified, so an incorrect assertion produces silently
+/// invalid tiling. When the hint is consulted, `Equal` collapses the tiled outer
+/// dim to a static 1 (the caller asserts the loop tile size equals the inner
+/// tile size, so there is exactly one inner tile), whereas `Multiple` keeps it
+/// dynamic (`ceilDiv` of the loop tile by the inner tile).
+///
+/// Entries are indexed by the dimensions the consulting method reasons about,
+/// i.e. the op's iteration domain (in pre-interchange order -- `interchange`
+/// reorders the generated loops only). This also holds for the
+/// `*FromOperandTiles` consumer-fusion methods: for a pack the iteration domain
+/// coincides with the unpacked operand's source dimensions, while for an unpack
+/// the entry for the i-th inner tile sits at its dest dimension
+/// `inner_dims_pos[i]` (a dimension of the unpacked tensor, not of the packed
+/// operand). Entries are not remapped through indexing maps or `outer_dims_perm`
+/// (for a transposing pack they stay in source order, pre-permutation), so the
+/// caller must pre-arrange them to match that order.
+enum class InnerTileAlignment : int64_t { Unknown = 0, Multiple, Equal };
+
+/// Returns true iff `value` is a valid `InnerTileAlignment` enumerator. The
+/// switch is intentional: adding an enumerator triggers `-Wswitch` here. Shared
+/// by the transform ops that accept the hint as a raw integer array, so the
+/// accepted set has a single definition.
+inline bool isValidInnerTileAlignment(int64_t value) {
+  switch (static_cast<InnerTileAlignment>(value)) {
+  case InnerTileAlignment::Unknown:
+  case InnerTileAlignment::Multiple:
+  case InnerTileAlignment::Equal:
+    return true;
+  }
+  return false;
+}
+
+/// Verifies that every entry of a raw `inner_tile_alignments` integer array is a
+/// valid `InnerTileAlignment`, emitting the standard op error on `op` otherwise.
+/// Shared by the transform ops that accept the hint so the accepted set and the
+/// diagnostic have a single definition.
+LogicalResult verifyInnerTileAlignments(Operation *op,
+                                        ArrayRef<int64_t> alignments);
+
+/// Maps a validated `inner_tile_alignments` integer array onto the per-dimension
+/// `InnerTileAlignment` hints consumed by the tiling driver.
+SmallVector<InnerTileAlignment>
+convertInnerTileAlignments(ArrayRef<int64_t> alignments);
+
 } // namespace mlir
 
 /// Include the ODS generated interface header files.
