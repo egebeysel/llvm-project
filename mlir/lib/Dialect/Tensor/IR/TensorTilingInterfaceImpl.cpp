@@ -22,6 +22,10 @@ using namespace mlir::tensor;
 namespace {
 
 struct PadOpTiling : public TilingInterface::ExternalModel<PadOpTiling, PadOp> {
+  using Base = TilingInterface::ExternalModel<PadOpTiling, PadOp>;
+  // Inherit the defaulted hint-bearing overloads; this op ignores the hint.
+  using Base::generateResultTileValue;
+  using Base::getTiledImplementation;
 
   SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *op) const {
     auto padOp = cast<PadOp>(op);
