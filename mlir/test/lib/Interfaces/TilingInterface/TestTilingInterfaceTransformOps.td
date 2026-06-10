@@ -93,7 +93,8 @@ def TestFuseConsumerOp : Op<Transform_Dialect, "test.fuse_consumer",
 
   let arguments = (ins 
       TransformHandleTypeInterface:$consumer,
-      Variadic<TransformHandleTypeInterface>:$loops);
+      Variadic<TransformHandleTypeInterface>:$loops,
+      DefaultValuedOptionalAttr<DenseI64ArrayAttr, "{}">:$inner_tile_alignments);
   let results = (outs TransformHandleTypeInterface:$fused_consumer,
       Variadic<TransformHandleTypeInterface>:$result_loops);
 
@@ -101,6 +102,7 @@ def TestFuseConsumerOp : Op<Transform_Dialect, "test.fuse_consumer",
     $consumer `into` `(` $loops `)`
     attr-dict `:` functional-type(operands, results)
   }];
+  let hasVerifier = 1;
 }
 
 

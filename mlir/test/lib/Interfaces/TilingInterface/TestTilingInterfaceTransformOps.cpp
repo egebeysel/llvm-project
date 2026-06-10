@@ -177,12 +177,13 @@ static LogicalResult
 applyFuseConsumer(RewriterBase &rewriter, Operation *transformOp,
                   Operation *consumer,
                   MutableArrayRef<LoopLikeOpInterface> loops,
+                  ArrayRef<InnerTileAlignment> innerTileAlignments,
                   TransformResults &transformResults) {
   SmallVector<Operation *> fusedConsumerOps;
   rewriter.setInsertionPoint(consumer);
 
   FailureOr<scf::SCFFuseConsumerOfSliceResult> fuseConsumerResults =
-      scf::tileAndFuseConsumer(rewriter, consumer, loops);
+      scf::tileAndFuseConsumer(rewriter, consumer, loops, innerTileAlignments);
   if (failed(fuseConsumerResults))
     return consumer->emitOpError("failed to fuse consumer of slice");
 
@@ -196,6 +197,10 @@ applyFuseConsumer(RewriterBase &rewriter, Operation *transformOp,
     transformResults.set(transformOp->getOpResult(index + 1), {loop});
   }
   return success();
+}
+
+LogicalResult transform::TestFuseConsumerOp::verify() {
+  return verifyInnerTileAlignments(getOperation(), getInnerTileAlignments());
 }
 
 DiagnosedSilenceableFailure
@@ -215,8 +220,11 @@ transform::TestFuseConsumerOp::apply(TransformRewriter &rewriter,
     }
     loops.push_back(loopLikeOp);
   }
-  LogicalResult result = applyFuseConsumer(rewriter, getOperation(), consumer,
-                                           loops, transformResults);
+  SmallVector<InnerTileAlignment> innerTileAlignments =
+      convertInnerTileAlignments(getInnerTileAlignments());
+  LogicalResult result =
+      applyFuseConsumer(rewriter, getOperation(), consumer, loops,
+                        innerTileAlignments, transformResults);
   return failed(result) ? DiagnosedSilenceableFailure::definiteFailure()
                         : DiagnosedSilenceableFailure::success();
 }
