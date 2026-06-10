@@ -100,3 +100,39 @@ transform.sequence failures(propagate) {
   // expected-error@below {{expected '('}}
   %res = transform.structured.generalize %arg0 : !transform.any_op -> !transform.any_op 
 }
+
+// -----
+
+transform.sequence failures(propagate) {
+^bb0(%arg0: !transform.any_op):
+  // expected-error@below {{expected inner_tile_alignments entries to be one of 0 (Unknown), 1 (Multiple) or 2 (Equal), but got 5}}
+  %1, %loop = transform.structured.tile_using_for %arg0 tile_sizes [8] {inner_tile_alignments = array<i64: 5>} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+}
+
+// -----
+
+transform.sequence failures(propagate) {
+^bb0(%arg0: !transform.any_op):
+  // expected-error@below {{expected inner_tile_alignments entries to be one of 0 (Unknown), 1 (Multiple) or 2 (Equal), but got -1}}
+  %1, %loop = transform.structured.fuse %arg0 tile_sizes [8] {inner_tile_alignments = array<i64: -1>} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+}
+
+// -----
+
+transform.sequence failures(propagate) {
+^bb0(%arg0: !transform.any_op):
+  %0 = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+  %1 = transform.structured.match ops{["tensor.empty"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+  // expected-error@below {{expected inner_tile_alignments entries to be one of 0 (Unknown), 1 (Multiple) or 2 (Equal), but got 7}}
+  %fused, %new = transform.structured.fuse_into_containing_op %0 into %1 {inner_tile_alignments = array<i64: 7>} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+}
+
+// -----
+
+transform.sequence failures(propagate) {
+^bb0(%arg0: !transform.any_op):
+  %0 = transform.structured.match ops{["scf.for"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+  %1 = transform.structured.match ops{["linalg.unpack"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+  // expected-error@below {{expected inner_tile_alignments entries to be one of 0 (Unknown), 1 (Multiple) or 2 (Equal), but got 3}}
+  %a, %b = transform.test.fuse_consumer %1 into (%0) {inner_tile_alignments = array<i64: 3>} : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+}
