@@ -432,6 +432,16 @@ def FuseOp : Op<Transform_Dialect, "structured.fuse",
     If `apply_cleanup` is true then slice canonicalization is applied between
     fusion steps. If `use_forall` is true then tiling method generates a
     `scf.forall` loop instead of `scf.for` loops.
+
+    The optional `inner_tile_alignments` attribute forwards a per-dimension
+    `InnerTileAlignment` hint (see `mlir/Interfaces/TilingInterface.h`) to the
+    tiling driver, so a fused scalable `linalg.pack`/`linalg.unpack` can be tiled
+    without re-deriving how each loop tile size relates to its inner tile size.
+    Entries are indexed in iteration-domain order; an empty array (the default)
+    preserves the prior behavior and the hint is ignored by ops that do not
+    consume it. The hint is a caller assertion: for genuinely scalable/dynamic
+    sizes it cannot be verified, so an incorrect entry silently produces invalid
+    tiling -- the caller owns its correctness.
   }];
 
   let arguments =
@@ -441,6 +451,7 @@ def FuseOp : Op<Transform_Dialect, "structured.fuse",
         Optional<TransformAnyParamTypeOrAnyHandle> : $packed_tile_sizes,
         DefaultValuedOptionalAttr<DenseI64ArrayAttr, "{}">:$static_tile_sizes,
         DefaultValuedOptionalAttr<DenseI64ArrayAttr, "{}">:$static_tile_interchange,
+        DefaultValuedOptionalAttr<DenseI64ArrayAttr, "{}">:$inner_tile_alignments,
         UnitAttr:$apply_cleanup,
         UnitAttr:$use_forall);
   let results = (outs TransformHandleTypeInterface:$transformed,
@@ -536,14 +547,27 @@ def FuseIntoContainingOp :
 
     This operation consumes the producer handle.
     This operation only reads the containing op handle.
+
+    The optional `inner_tile_alignments` attribute forwards a per-dimension
+    `InnerTileAlignment` hint (see `mlir/Interfaces/TilingInterface.h`) to each
+    fused producer, so a scalable `linalg.unpack` producer can be tiled without
+    re-deriving how each loop tile size relates to its inner tile size. Entries
+    are indexed in the producer's iteration-domain order; an empty array (the
+    default) preserves the prior behavior. The hint is ignored by producers that
+    do not consume it (e.g., `linalg.pack`, which is only alignment-sensitive when
+    fused as a consumer). The hint is a caller assertion: for genuinely
+    scalable/dynamic sizes it cannot be verified, so an incorrect entry silently
+    produces invalid tiling -- the caller owns its correctness.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$producer_op,
-                       TransformHandleTypeInterface:$containing_op);
+                       TransformHandleTypeInterface:$containing_op,
+                       DefaultValuedOptionalAttr<DenseI64ArrayAttr, "{}">:$inner_tile_alignments);
   let results = (outs TransformHandleTypeInterface:$fused_op,
                       TransformHandleTypeInterface:$new_containing_op);
   let assemblyFormat = "$producer_op `into` $containing_op attr-dict "
                        " `:` functional-type(operands, results)";
+  let hasVerifier = 1;
 
   let builders = [
     OpBuilder<(ins "Value":$producerOp, "Value":$containingOp)>
@@ -2266,13 +2290,24 @@ def TileUsingForOp : Op<Transform_Dialect, "structured.tile_using_for",
 
     If the internal implementation of tiling for any of the operations fails,
     produces a definite failure.
+
+    The optional `inner_tile_alignments` attribute forwards a per-dimension
+    `InnerTileAlignment` hint (see `mlir/Interfaces/TilingInterface.h`) to the
+    tiling driver, so a scalable `linalg.pack`/`linalg.unpack` can be tiled
+    without re-deriving how each loop tile size relates to its inner tile size.
+    Entries are indexed in iteration-domain order; an empty array (the default)
+    preserves the prior behavior and the hint is ignored by ops that do not
+    consume it. The hint is a caller assertion: for genuinely scalable/dynamic
+    sizes it cannot be verified, so an incorrect entry silently produces invalid
+    tiling -- the caller owns its correctness.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$target,
                    Variadic<TransformAnyParamTypeOrAnyHandle>:$dynamic_sizes,
                    DefaultValuedOptionalAttr<DenseI64ArrayAttr, "{}">:$static_sizes,
                    DefaultValuedOptionalAttr<DenseI64ArrayAttr, "{}">:$interchange,
-                   DefaultValuedOptionalAttr<DenseBoolArrayAttr, "{}">:$scalable_sizes);
+                   DefaultValuedOptionalAttr<DenseBoolArrayAttr, "{}">:$scalable_sizes,
+                   DefaultValuedOptionalAttr<DenseI64ArrayAttr, "{}">:$inner_tile_alignments);
   let results = (outs TransformHandleTypeInterface:$tiled_linalg_op,
                       Variadic<TransformHandleTypeInterface>:$loops);
   let builders = [
